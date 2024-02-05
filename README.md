@@ -1,6 +1,6 @@
 # Proxy-DLL-Loads
 
-Thanks to https://github.com/kleiton0x00/Proxy-DLL-Loads/
+Thanks to, https://github.com/kleiton0x00/Proxy-DLL-Loads/
 
 ## References 
 - [Intercepting API Calls via DLL Redirection](https://dl.packetstormsecurity.net/papers/win/intercept_apis_dll_redirection.pdf)
