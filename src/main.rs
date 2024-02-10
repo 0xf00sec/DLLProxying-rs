@@ -1,79 +1,95 @@
+extern crate winapi;
+
 use std::ffi::CString;
-use winapi::um::libloaderapi::{AddVectoredExceptionHandler, FreeLibrary, GetProcAddress, GetModuleHandleA, RemoveVectoredExceptionHandler};
-use winapi::um::processthreadsapi::Sleep;
-use winapi::um::winnt::{EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, LONG, PAGE_EXECUTE_READ, PAGE_GUARD, STATUS_GUARD_PAGE_VIOLATION, VirtualProtect};
+use std::ptr;
+use winapi::um::libloaderapi::{FreeLibrary, LoadLibraryA};
+use winapi::um::processthreadsapi::{CreateThread, GetCurrentThread, ResumeThread, WaitForSingleObject};
+use winapi::um::winnt::{EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, LONG, PAGE_EXECUTE_READ, PAGE_GUARD, STATUS_GUARD_PAGE_VIOLATION};
+use winapi::um::handleapi::CloseHandle;
 
 static MODULE_NAME: &str = "foo.dll";
 
-fn GetModuleHandle(module_name: &str) -> *mut std::ffi::c_void {
+extern "system" fn veh(exception_info: *mut EXCEPTION_POINTERS) -> LONG {
     unsafe {
-        GetModuleHandleA(CString::new(module_name).unwrap().as_ptr())
-    }
-}
-
-fn ProcAddress(module: *mut std::ffi::c_void, proc_name: &str) -> *mut std::ffi::c_void {
-    unsafe {
-        GetProcAddress(module, CString::new(proc_name).unwrap().as_ptr())
-    }
-}
-
-extern "system" fn VEH(exception_info: *mut EXCEPTION_POINTERS) -> LONG {
-    unsafe {
-        // Check for STATUS_GUARD_PAGE_VIOLATION
         if (*(*exception_info).ExceptionRecord).ExceptionCode == STATUS_GUARD_PAGE_VIOLATION {
-            // Get the address of "LoadLibraryA"
-            let kernel32_module = GetModuleHandle("kernel32.dll");
-            let load_library_addr = ProcAddress(kernel32_module, "LoadLibraryA");
+            let kernel32_module = LoadLibraryA(CString::new("kernel32.dll").unwrap().as_ptr());
+            if kernel32_module.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
 
-            let rip_offset = /* dynamically calculated offset */;
-            let rip = (*(*exception_info).ContextRecord).Rip as usize;
-            let dynamic_load_library_addr = (rip - rip_offset) as *mut std::ffi::c_void;
+            let load_library_addr = GetProcAddress(kernel32_module, CString::new("LoadLibraryA").unwrap().as_ptr());
+            if load_library_addr.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
 
-            // Set RIP register directly to the dynamically calculated address
-            (*(*exception_info).ContextRecord).Rip = dynamic_load_library_addr as u64;
+            // Create a new thread to execute LoadLibraryA
+            let mut thread_id: winapi::shared::minwindef::DWORD = 0;
+            let thread_handle = CreateThread(
+                ptr::null_mut(),
+                0,
+                load_library_addr as winapi::um::winnt::LPTHREAD_START_ROUTINE,
+                MODULE_NAME.as_ptr() as *mut winapi::ctypes::c_void,
+                0,
+                &mut thread_id,
+            );
+            if thread_handle.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
 
-            // Set the RCX register to the address of the DLL name
-            (*(*exception_info).ContextRecord).Rcx = GetModuleHandle(MODULE_NAME) as u64;
+            // Wait 4or the thread to finish exec LoadLibraryA
+            WaitForSingleObject(thread_handle, winapi::um::synchapi::INFINITE);
 
-            // Resume execution
+            // Close the thread handle
+            CloseHandle(thread_handle);
+
+            // Resume execution 
             EXCEPTION_CONTINUE_EXECUTION
         } else {
-            // Continue searching for other exception handlers
             EXCEPTION_CONTINUE_SEARCH
         }
     }
 }
 
-// Function to load a DLL with a proxied exception handler
-fn ProxiedLoadLib(lib_name: &str) -> Option<*mut std::ffi::c_void> {
+fn proxied_load_lib(lib_name: &str) -> Option<*mut std::ffi::c_void> {
     unsafe {
-        // Vectored Exception Handler
-        let handler = AddVectoredExceptionHandler(1, Some(VEH));
+        let handler = winapi::um::errhandlingapi::AddVectoredExceptionHandler(1, Some(veh));
         if handler.is_null() {
             println!("Failed to install Vectored Exception Handler");
             return None;
         }
 
+        // Allocate a guarded memory page to trigger the VEH
+        let mut page: winapi::shared::minwindef::LPVOID = ptr::null_mut();
+        if winapi::um::memoryapi::VirtualAlloc(ptr::null_mut(), 4096, winapi::um::winnt::MEM_RESERVE | winapi::um::winnt::MEM_COMMIT, winapi::um::winnt::PAGE_NOACCESS) == ptr::null_mut() {
+            println!("Failed to allocate memory page");
+            return None;
+        }
+
         // Triggering the VEH
         let mut old_protection = 0;
-        VirtualProtect(Sleep as _, 1, PAGE_EXECUTE_READ | PAGE_GUARD, &mut old_protection);
+        if winapi::um::memoryapi::VirtualProtect(page, 1, PAGE_GUARD, &mut old_protection) == 0 {
+            println!("Failed to set protection");
+            return None;
+        }
 
-        // Retrieve the module handle
-        let addr = GetModuleHandle(lib_name);
+        let addr = GetModuleHandleA(CString::new(lib_name).unwrap().as_ptr());
+
+        // Free 
+        winapi::um::memoryapi::VirtualFree(page, 0, winapi::um::winnt::MEM_RELEASE);
 
         // Remove the Vectored Exception Handler
-        RemoveVectoredExceptionHandler(handler);
+        winapi::um::errhandlingapi::RemoveVectoredExceptionHandler(handler);
 
         Some(addr)
     }
 }
 
 fn main() {
-    let user32 = ProxiedLoadLib(MODULE_NAME);
-    match user32 {
+    let foo_dll = proxied_load_lib(MODULE_NAME);
+    match foo_dll {
         Some(addr) => {
             println!("{} Address: {:?}", MODULE_NAME, addr);
-            unsafe { FreeLibrary(addr) };
+            FreeLibrary(addr);
         }
         None => println!("Failed to load {}", MODULE_NAME),
     }
